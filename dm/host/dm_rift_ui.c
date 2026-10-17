@@ -84,7 +84,15 @@ void dm_rift_ui_on_uimsg(const char *cat, const char *act, const char *arg) {
 // Dark red covers for the six new equipment slots in the mercenary panel (TouchMercLock_<body location>, layout merc_slots.py): moved onto their cells when not unlocked, moved off-screen once unlocked. Only our own Touch* widgets are written
 static void merc_lock_pump(void) {
     static const struct { const char *n; } k[] = { { "TouchMercLock_neck" }, { "TouchMercLock_gloves" }, { "TouchMercLock_right_hand" }, { "TouchMercLock_belt" }, { "TouchMercLock_left_hand" }, { "TouchMercLock_feet" } };
-    uint64_t p = panel_named("HirelingInventoryPanel"); if (!p || !*(uint8_t *)(uintptr_t)(p + 0x51)) return; int lock = !dm_rift_merc_unlocked();
+    uint64_t p = panel_named("HirelingInventoryPanel"); if (!p) return;
+    // 新增格是布局资源创建的原版控件；如果等面板可见后才补部位号，原版可能已在同一帧对焦点 / 提示框访问它。
+    // 在面板隐藏时也先完成初始化，避免首次打开佣兵页时原版读到 0 部位号 / 0 尺寸。
+    // The added cells are original widgets created by the layout resource. If their body location is filled only after the panel becomes visible, the original game may already access them for focus / tooltips in that frame.
+    // Initialize them while hidden too, so the original game cannot observe a zero body location / zero size on the first frame the mercenary page opens.
+    { static const struct { const char *n; uint32_t loc; } sl[] = { { "slot_neck", 2 }, { "slot_right_hand", 6 }, { "slot_left_hand", 7 }, { "slot_belt", 8 }, { "slot_feet", 9 }, { "slot_gloves", 10 } };
+      for (unsigned i = 0; i < sizeof sl / sizeof *sl; i++) { uint64_t w = find(p, sl[i].n, 0); if (!w || *(uint64_t *)w - (uint64_t)(uintptr_t)rb() != 0x2089fa0 || *(uint32_t *)(uintptr_t)(w + 0x5d8) == sl[i].loc) continue;
+          *(uint32_t *)(uintptr_t)(w + 0x5d8) = sl[i].loc; *(uint64_t *)(uintptr_t)(w + 0x5b8) = 0x6200000062ull; LOG("佣兵装备位：面板里的 %s 补上部位号 %u", sl[i].n, sl[i].loc); } }
+    if (!*(uint8_t *)(uintptr_t)(p + 0x51)) return; int lock = !dm_rift_merc_unlocked();
     for (unsigned i = 0; i < sizeof k / sizeof *k; i++) {   // 盖板的横坐标取同部位物品格 slot_<部位> 的（布局里两者同一个矩形，盖板只是先放在屏外），格位只在布局脚本里定一处 | The cover's x is taken from the item cell slot_<body location> of the same body location (in the layout the two share one rectangle, the cover is just initially placed off-screen), so cell positions are defined in one place only, the layout script
         char sn[32]; snprintf(sn, sizeof sn, "slot_%s", k[i].n + 14); uint64_t w = find(p, k[i].n, 0), sl = find(p, sn, 0);
         if (w && sl) rect(w, lock ? ((int32_t *)(uintptr_t)(sl + 0x70))[0] : 99999, ((int32_t *)(uintptr_t)(w + 0x70))[1]); }
@@ -97,13 +105,6 @@ static void merc_lock_pump(void) {
             if (!nm || strncmp(nm, "slot_", 5) || !dm_widget_is_slot(b, w) || *(uint32_t *)(uintptr_t)(w + 0x5c8) != 1) continue;   // +0x5c8（属主）是物品格专有字段：先核类。指针本身不会悬空——原版控件析构（main+0xabee7c → 0xabdf4c）会把焦点管理器里指向自己的 +0x190 / +0x178 清掉 | +0x5c8 (owner) is an item-slot-only field: check the class first. The pointer itself cannot dangle: the game's widget destructor (main+0xabee7c → 0xabdf4c) clears the focus manager's +0x190 / +0x178 that point to it
             for (unsigned i = 0; i < sizeof k / sizeof *k; i++) if (!strcmp(nm + 5, k[i].n + 14)) cur = w; }
         if (cur && cur != dm_wref_get(&last)) dm_rift_merc_locked_hint(); dm_wref_set(&last, cur); }
-    // 六个新物品格（布局里我们加的 slot_<部位>，原版物品格控件）：原版佣兵面板的初始化只给它认识的四个格填「身体部位号」（控件 +0x5d8：头 1 / 身 3 / 右手 4 / 左手 5）和格子尺寸（+0x5b8 两个 32 位 = 98），
-    // 我们加的六个这两处是 0，控件就不知道该画佣兵哪个部位上的物品（客户端佣兵身上有这些物品，格子却是空的——实测）。面板每次建出来时补一次，值照玩家物品栏面板里同名格的（2 / 6 / 7 / 8 / 9 / 10）
-    // The six new item cells (slot_<body location> that we add in the layout, original item cell widgets): the original mercenary panel's initialization fills in the "body location number" (widget +0x5d8: head 1 / torso 3 / right hand 4 / left hand 5) and the cell size (+0x5b8, two 32-bit values = 98) only for the four cells it knows,
-    // for the six we add these two are 0, so the widget does not know which mercenary body location's item to draw (the client mercenary has these items on it, yet the cells are empty -- measured). Filled in once each time the panel is built, with the values of the same-named cells in the player inventory panel (2 / 6 / 7 / 8 / 9 / 10)
-    { static const struct { const char *n; uint32_t loc; } sl[] = { { "slot_neck", 2 }, { "slot_right_hand", 6 }, { "slot_left_hand", 7 }, { "slot_belt", 8 }, { "slot_feet", 9 }, { "slot_gloves", 10 } };
-      for (unsigned i = 0; i < sizeof sl / sizeof *sl; i++) { uint64_t w = find(p, sl[i].n, 0); if (!w || *(uint64_t *)w - (uint64_t)(uintptr_t)rb() != 0x2089fa0 || *(uint32_t *)(uintptr_t)(w + 0x5d8) == sl[i].loc) continue;
-          *(uint32_t *)(uintptr_t)(w + 0x5d8) = sl[i].loc; *(uint64_t *)(uintptr_t)(w + 0x5b8) = 0x6200000062ull; LOG("佣兵装备位：面板里的 %s 补上部位号 %u", sl[i].n, sl[i].loc); } }
 }
 void dm_rift_ui_pump(void) {
     merc_lock_pump();
