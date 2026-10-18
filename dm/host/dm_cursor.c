@@ -146,6 +146,32 @@ static uint64_t modal_any(uint64_t root, int with_bind, const char **name) {
 }
 static uint64_t ui_find(uint64_t w, const char *name, int dep);
 static uint64_t ui_panel(uint64_t root, const char *name);   // 只扫界面根的直接子控件（定义在后面） | Scans only the direct children of the UI root (defined later)
+static void merc_cursor_diag(uint64_t buttons, int32_t lx, int32_t ly) {
+    static uint64_t last_frame, last_focus, last_hover;
+    static int32_t last_x, last_y;
+    static int last_a;
+    uint64_t frame = dm_guest_frame();
+    module_t *m = main_module(); if (!m) return;
+    uint64_t root = 0; memcpy(&root, m->base + 0x2f05458, 8);
+    uint64_t merc = root ? ui_panel(root, "HirelingInventoryPanel") : 0;
+    if (!merc || !*(uint8_t *)(merc + 0x50)) { last_focus = last_hover = 0; return; }
+    uint64_t inv = ui_panel(root, "PlayerInventoryExpansionLayout");
+    uint64_t fm = root ? *(uint64_t *)(root + 0xd0) : 0;
+    uint64_t focus = fm ? *(uint64_t *)(fm + 0x190) : 0;
+    uint64_t hover = fm ? *(uint64_t *)(fm + 0x178) : 0;
+    int32_t x = *(int32_t *)(m->base + 0x2d128f8), y = *(int32_t *)(m->base + 0x2d128fc);
+    int a = !!(buttons & DM_BTN_A);
+    int moved = x != last_x || y != last_y || lx || ly;
+    int changed = focus != last_focus || hover != last_hover || a != last_a;
+    int motion_due = moved && (!last_frame || frame - last_frame >= 6);
+    crash_diag_cursor_state(focus, hover, x, y);
+    if (!changed && !motion_due && last_frame && frame - last_frame < 60) return;
+    last_focus = focus; last_hover = hover; last_a = a; last_x = x; last_y = y; last_frame = frame;
+    int dm_padmode_current(void);
+    LOG("佣兵页光标诊断%s：帧 %llu 手柄模式=%d 物品栏=%d 位置 %d,%d 摇杆 %d,%d A=%d 焦点=%#llx 悬停控件=%#llx",
+        changed ? "状态变化" : motion_due ? "光标移动" : "心跳", (unsigned long long)frame, dm_padmode_current(), inv && *(uint8_t *)(inv + 0x50),
+        x, y, lx, ly, a, (unsigned long long)focus, (unsigned long long)hover);
+}
 static int free_cursor_page(module_t *m) {
     static uint64_t at = UINT64_MAX; static int yes; static const char *whyp = ""; uint64_t fr = dm_guest_frame(); if (fr == at) return yes;
     // 有自由光标 = 开着的面板里有物品区 / 技能图标 / 属性「+」，并且上面没有盖着模态的一层（数量框、确认框、交易结果提示）：
@@ -175,13 +201,20 @@ static int sn_on; static _Atomic uint64_t g_snap;   // 就近吸附中；g_snap 
 static _Atomic int g_free_pub;
 int dm_ui_free_cursor(void) { return atomic_load(&g_free_pub); }   // 当前页有没有自由光标（物品栏 / 技能树 / 属性页这类） | Whether the current page has a free cursor (pages such as inventory / skill tree / attributes)
 void dm_cursor_apply(uint64_t *buttons, int32_t *lx, int32_t *ly) {
+    int dm_padmode_current(void); int padmode = dm_padmode_current();
+    uint32_t detail = ((uint32_t)(uint16_t)*lx) | ((uint32_t)(uint16_t)*ly << 16) | ((uint32_t)padmode << 30) | ((uint32_t)!!(*buttons & DM_BTN_A) << 31);
+    crash_diag_mark(CRASH_CTX_MERC_CURSOR_TRACE, (uint32_t)dm_guest_frame(), detail);
+    merc_cursor_diag(*buttons, *lx, *ly);
+    crash_diag_mark(CRASH_CTX_MERC_CURSOR_TRACE_DONE, (uint32_t)dm_guest_frame(), detail);
+    crash_diag_mark(CRASH_CTX_CURSOR_APPLY, (uint32_t)dm_guest_frame(), detail);
     cursor_apply(buttons, lx, ly);
+    crash_diag_mark(CRASH_CTX_CURSOR_APPLY_DONE, (uint32_t)dm_guest_frame(), detail);
     // 装备对比（单击装备 = 自己的说明 + 身上那件并排，不加手势不加按钮）：原版是「按住来比较」，触摸没有按住的键——
     // 有物品区的面板开着期间一直开着对比位（dm_item_compare，不经手柄键、不翻页签），说明框出来时就并排带上身上同部位那件；面板关了收掉
     // Equipment comparison (single tap on equipment = its own description + the equipped item side by side, with no added gesture and no added button): the original game is 'hold to compare', and touch has no key to hold --
     // while a panel with an item area is open, the compare bit stays on (dm_item_compare, without going through controller keys and without flipping tabs), so when the tooltip appears it brings the equipped item of the same slot side by side; turned off when the panel closes
     { module_t *cm = main_module(); static int cmp = -1; int want = cm ? free_cursor_page(cm) : 0; atomic_store(&g_free_pub, want);
-      int dm_padmode_current(void); int c = want && !dm_padmode_current(); if (c != cmp) { cmp = c; dm_item_compare(c); } }   // 手柄模式照原版：按住对比键才对比（符文之语清单也靠这一位认「按住对比键」） | Controller mode follows the original: compare only while the compare button is held (the runeword list also relies on this bit to detect "compare button held")
+      int c = want && !padmode; if (c != cmp) { cmp = c; dm_item_compare(c); } }   // 手柄模式照原版：按住对比键才对比（符文之语清单也靠这一位认「按住对比键」） | Controller mode follows the original: compare only while the compare button is held (the runeword list also relies on this bit to detect "compare button held")
     if ((*buttons & DM_BTN_A) && atomic_load(&g_a_wait)) atomic_store(&g_a_wait, now_ns());   // A 还按着：兜底的 0.3 秒从松开那一刻起算 | A is still held: the fallback's 0.3 seconds are counted from the moment of release
 }
 static dm_wref g_down; static _Atomic uint64_t g_origin_xy;   // 按下那次命中的物品区控件；最近一次「拿起」的物品原位中心（位 63 = 有效，x | y << 32 的低 31 位） | Item-area widget hit by that press; center of the original position of the most recently 'picked up' item (bit 63 = valid, low 31 bits of x | y << 32)

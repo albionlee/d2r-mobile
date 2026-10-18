@@ -281,7 +281,9 @@ static void w_go_step(void) {
     // 2 格内而还没到 1 格时不在这里到达，落到下面「已在 4 格内 → 朝它直走一次」那条；真走不进 1 格的（原地停 1 秒）仍由上面的「就地」兜底
     // An exit tile is interacted with only from within 1 cell: sending the interaction (0x40) from 2 cells away diagonally, the server does not change level (Crystalline Passage -> Frozen River 5/5 runs: player 10373,5200, exit tile 10371,5198; the two spots at offsets (1,2) and (1,0) were measured to get in).
     // Within 2 cells but not yet within 1, do not arrive here; fall through to the "already within 4 cells -> walk straight toward it once" rule below; one that really cannot get within 1 cell (standing still for 1 second) is still caught by the "in place" rule above
-    int near = g_go.type == 5 ? 1 : W_NEAR;
+    // Town portals are object units (class 59). Interacting at the generic 2-cell
+    // threshold can be rejected server-side; wait until adjacent, like exit tiles.
+    int near = g_go.type == 5 || (g_go.type == 2 && *(uint32_t *)(u + 4) == 59) ? 1 : W_NEAR;
     if (!g_go.stop_at && dx <= near && dy <= near) { w_arrive(pl, u, px, py, ox, oy, "到跟前"); return; }
     if (!g_go.stop_at && g_go.type == 5 && dx <= W_NEAR && dy <= W_NEAR && !g_go.direct) { g_go.n = g_go.i = 0; g_go.direct = 1; g_go.still_fr = 0; g_go.next_fr = dm_guest_frame() + 20; atomic_store(&g_dm_move_allow_until_ns, w_now_ns() + 500000000ull); ((void (*)(int, uint64_t, int, int))(b + 0x4ad870))(3, pl, x, y); return; }
     if (!g_go.stop_at && g_go.type == 5 && g_go.direct) return;   // 直走那一步进行中：等到 1 格内或原地停 1 秒 | the straight-walk step is in progress: wait until within 1 cell or standing still for 1 second

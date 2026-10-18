@@ -1830,7 +1830,17 @@ static void loadscreen_on_uimsg(const char *cat, const char *act, const char *ar
             else if (off && strstr(m, off)) { LOG("DM_TEST_FRZ：「%s」命中 → 世界冻结状态位 关", m); mtl_world_frozen(0); } }
     }
     if (!strcmp(cat, "PanelManager") && !strcmp(arg, "CharacterCreateNamePanel")) { extern int g_swkbd_name_panel; g_swkbd_name_panel = !strcmp(act, "OpenPanel") || !strcmp(act, "OpenExclusivePanel"); }
-    { void dm_ui_on_uimsg(const char *, const char *, const char *); dm_ui_on_uimsg(cat, act, arg); }   // 前端路径理顺（dm_cursor.c）：借这个恒订阅的回调 | Front-end path straightening (dm_cursor.c): borrows this always-subscribed callback
+    { void dm_ui_on_uimsg(const char *, const char *, const char *);
+      uint32_t trace = 0;
+      if (!strcmp(cat, "PanelManager")) {
+          int open = !strcmp(act, "OpenPanel") || !strcmp(act, "OpenExclusivePanel");
+          int close = !strcmp(act, "ClosePanel") || !strcmp(act, "UnloadPanel");
+          if (!strcmp(arg, "HirelingInventoryPanel")) trace = open ? 1 : close ? 2 : 0;
+          else if (!strcmp(arg, "PlayerInventoryExpansionLayout")) trace = open ? 3 : close ? 4 : 0;
+      }
+      if (trace) crash_diag_mark(CRASH_CTX_UI_MSG, cur_tick(), trace);
+      dm_ui_on_uimsg(cat, act, arg);
+      if (trace) crash_diag_mark(CRASH_CTX_UI_MSG_DONE, cur_tick(), trace); }   // 前端路径理顺（dm_cursor.c）：借这个恒订阅的回调 | Front-end path straightening (dm_cursor.c): borrows this always-subscribed callback
     if (strcmp(arg, "LoadScreenPanel")) return;
     pthread_mutex_lock(&g_shotgate_mu);
     if (!strcmp(act, "OpenPanel") || !strcmp(act, "OpenExclusivePanel")) {

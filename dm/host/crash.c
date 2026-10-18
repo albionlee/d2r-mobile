@@ -20,6 +20,9 @@ static _Atomic uint32_t g_watch_tick;
 static _Atomic int g_watch_pregame = 1;
 static _Atomic int g_watch_stage_idx;
 static char g_watch_stage[2][256] = {"启动", "启动"};
+static _Atomic uint32_t g_diag_site, g_diag_frame, g_diag_detail;
+static _Atomic uint64_t g_diag_focus, g_diag_hover;
+static _Atomic int32_t g_diag_cursor_x, g_diag_cursor_y;
 static unsigned g_watch_stall;
 static void (*g_dump_hook)(void);
 static void (*g_wait_dump)(void);
@@ -36,6 +39,17 @@ void crash_watch_progress(uint32_t tick, const char *stage) {
     atomic_store(&g_watch_stage_idx, next);
     atomic_fetch_add(&g_watch_count, 1);
     atomic_store(&g_watch_last_ns, watch_now_ns());
+}
+void crash_diag_mark(uint32_t site, uint32_t frame, uint32_t detail) {
+    atomic_store_explicit(&g_diag_frame, frame, memory_order_relaxed);
+    atomic_store_explicit(&g_diag_detail, detail, memory_order_relaxed);
+    atomic_store_explicit(&g_diag_site, site, memory_order_release);
+}
+void crash_diag_cursor_state(uint64_t focus, uint64_t hover, int32_t x, int32_t y) {
+    atomic_store_explicit(&g_diag_focus, focus, memory_order_relaxed);
+    atomic_store_explicit(&g_diag_hover, hover, memory_order_relaxed);
+    atomic_store_explicit(&g_diag_cursor_x, x, memory_order_relaxed);
+    atomic_store_explicit(&g_diag_cursor_y, y, memory_order_release);
 }
 void crash_watch_frame(void) { if (atomic_load(&g_watch_pregame)) crash_watch_progress(0, "出图帧"); }
 void crash_watch_pregame_done(void) { atomic_store(&g_watch_pregame, 0); }
@@ -74,12 +88,81 @@ static void *watchdog_main(void *arg) {
     }
     return NULL;
 }
+static size_t eh_value_size(uint8_t enc) {
+    switch (enc & 0x0f) { case 0x03: case 0x0b: return 4; case 0x04: return 8; default: return 0; }
+}
+static int eh_value(const module_t *m, uint64_t ehoff, uint64_t off, uint8_t enc, uint64_t *value) {
+    size_t n = eh_value_size(enc);
+    if (!n || off > m->size || n > m->size - off || (enc & 0x80)) return 0;
+    int64_t v;
+    switch (enc & 0x0f) {
+    case 0x03: v = *(const uint32_t *)(m->base + off); break;
+    case 0x0b: v = *(const int32_t *)(m->base + off); break;
+    case 0x04: v = (int64_t)*(const uint64_t *)(m->base + off); break;
+    default: return 0;
+    }
+    switch (enc & 0x70) {
+    case 0x00: break;
+    case 0x10: v += (int64_t)off;
+        break;
+    case 0x30: v += (int64_t)ehoff;
+        break;
+    default: return 0;
+    }
+    if (v < 0 || (uint64_t)v >= m->size) return 0;
+    *value = (uint64_t)v;
+    return 1;
+}
+// Resolve an address to the nearest FDE start in the guest image's eh_frame_hdr.
+// The Guest.framework intentionally omits symbols, but the image retains this compact unwind index.
+static int crash_guest_function(const module_t *m, uint64_t pc, uint64_t *start) {
+    if (!m || !m->base || !start || pc >= m->size || pc >= m->text_end || m->size < 24) return 0;
+    uint32_t mod0 = *(const uint32_t *)(m->base + 4);
+    if (mod0 > m->size - 20 || memcmp(m->base + mod0, "MOD0", 4)) return 0;
+    int64_t eh = (int64_t)mod0 + *(const int32_t *)(m->base + mod0 + 16);
+    if (eh < 0 || (uint64_t)eh > m->size - 4) return 0;
+    uint64_t ehoff = (uint64_t)eh;
+    const uint8_t *h = m->base + ehoff;
+    uint8_t penc = h[1], cenc = h[2], tenc = h[3];
+    uint64_t off = ehoff + 4, ignored, count;
+    size_t pn = eh_value_size(penc), cn = eh_value_size(cenc), tn = eh_value_size(tenc);
+    if (!pn || !cn || !tn || !eh_value(m, ehoff, off, penc, &ignored)) return 0;
+    off += pn;
+    if (!eh_value(m, ehoff, off, cenc, &count) || !count || count > 200000) return 0;
+    off += cn;
+    if (count > (m->size - off) / (2 * tn)) return 0;
+    uint64_t lo = 0, hi = count;
+    while (lo < hi) {
+        uint64_t mid = lo + (hi - lo) / 2, addr;
+        if (!eh_value(m, ehoff, off + mid * 2 * tn, tenc, &addr)) return 0;
+        if (addr <= pc) lo = mid + 1; else hi = mid;
+    }
+    if (!lo) return 0;
+    return eh_value(m, ehoff, off + (lo - 1) * 2 * tn, tenc, start);
+}
+static const char *crash_guest_symbol(const module_t *m, uint64_t start) {
+    if (!m || !m->symtab || !m->strtab) return NULL;
+    for (unsigned i = 1; i < m->nsym; i++) {
+        const Elf64_Sym *s = &m->symtab[i];
+        if (s->st_shndx && (s->st_info & 0x0f) == 2 && s->st_value == start && s->st_name)
+            return m->strtab + s->st_name;
+    }
+    return NULL;
+}
 void crash_off(const char *tag, uint64_t a) {   // diag.c 也用 | Also used by diag.c
 #define off crash_off
 
     module_t *m = module_of((void *)a);
     Dl_info di;
-    if (m) fprintf(stderr, " %s%s%s+%#llx", tag, *tag ? "=" : "", m->name, a - (uint64_t)m->base);
+    if (m) {
+        uint64_t pc = a - (uint64_t)m->base, fn;
+        fprintf(stderr, " %s%s%s+%#llx", tag, *tag ? "=" : "", m->name, (unsigned long long)pc);
+        if (crash_guest_function(m, pc, &fn)) {
+            const char *name = crash_guest_symbol(m, fn);
+            if (name) fprintf(stderr, " [fn=%s+%#llx]", name, (unsigned long long)(pc - fn));
+            else fprintf(stderr, " [fn=%s+%#llx+%#llx]", m->name, (unsigned long long)fn, (unsigned long long)(pc - fn));
+        }
+    }
     else if (dladdr((void *)a, &di) && di.dli_sname) fprintf(stderr, " %s%s%s+%#lx", tag, *tag ? "=" : "", di.dli_sname, (unsigned long)(a - (uint64_t)di.dli_saddr));
     else fprintf(stderr, " %s%s%#llx", tag, *tag ? "=" : "", a);
 }
@@ -129,6 +212,22 @@ void crash_set_wait_dump(void (*fn)(void)) { g_wait_dump = fn; }
 // 按需导出现场（不退出）：iOS 包没有无进展看门狗，冒烟判红时经 DM_LOG_PORT 发 dump 触发——各客体线程在等什么 + 图形侧等待点，和看门狗打的是同一份
 // Dump the current state on demand (without exiting): the iOS app has no no-progress watchdog, so when the smoke test fails it sends dump through DM_LOG_PORT to trigger this -- what each guest thread is waiting on + the graphics-side wait points, the same thing the watchdog prints
 void crash_dump_now(const char *why) { fprintf(stderr, "[dm] 现场导出（%s）：拍 %u / 阶段 %s\n", why, atomic_load(&g_watch_tick), g_watch_stage[atomic_load(&g_watch_stage_idx)]); if (g_dump_hook) g_dump_hook(); if (g_wait_dump) g_wait_dump(); }
+static const char *crash_context_name(uint32_t site) {
+    switch (site) {
+    case CRASH_CTX_UI_MSG: return "UI-message-handler";
+    case CRASH_CTX_UI_MSG_DONE: return "UI-message-handler-returned";
+    case CRASH_CTX_CURSOR_APPLY: return "controller-cursor-enter";
+    case CRASH_CTX_CURSOR_APPLY_DONE: return "controller-cursor-returned";
+    case CRASH_CTX_MERC_PANEL: return "merc-panel-found";
+    case CRASH_CTX_MERC_SLOTS_DONE: return "merc-slot-init-returned";
+    case CRASH_CTX_MERC_PUMP_DONE: return "merc-ui-pump-returned";
+    case CRASH_CTX_RIFT_PUMP: return "rift-ui-pump-enter";
+    case CRASH_CTX_RIFT_PUMP_DONE: return "rift-ui-pump-returned";
+    case CRASH_CTX_MERC_CURSOR_TRACE: return "merc-cursor-trace";
+    case CRASH_CTX_MERC_CURSOR_TRACE_DONE: return "merc-cursor-trace-returned";
+    default: return "none";
+    }
+}
 static void on_crash(int sig, siginfo_t *si, void *uc_) {
     ucontext_t *uc = uc_;
     if (sig == SIGTRAP && g_trap_hook && g_trap_hook(uc)) return;
@@ -139,6 +238,17 @@ static void on_crash(int sig, siginfo_t *si, void *uc_) {
     fprintf(stderr, "[dm] CRASH sig=%d", sig);
     off("addr", (uint64_t)si->si_addr); off("pc", uc->uc_mcontext->__ss.__pc); off("lr", uc->uc_mcontext->__ss.__lr);
     fprintf(stderr, " sp=%#llx\n", uc->uc_mcontext->__ss.__sp);
+    { uint32_t site = atomic_load_explicit(&g_diag_site, memory_order_acquire);
+      uint32_t detail = atomic_load_explicit(&g_diag_detail, memory_order_relaxed);
+      fprintf(stderr, "[dm] CRASH_CONTEXT site=%u(%s) frame=%u detail=%#x last_ui_tick=%u last_ui=%s\n", site, crash_context_name(site),
+              atomic_load_explicit(&g_diag_frame, memory_order_relaxed), detail,
+              atomic_load(&g_watch_tick), g_watch_stage[atomic_load(&g_watch_stage_idx)]);
+      fprintf(stderr, "[dm] CRASH_CURSOR focus=%#llx hover=%#llx xy=%d,%d\n",
+              (unsigned long long)atomic_load(&g_diag_focus), (unsigned long long)atomic_load(&g_diag_hover),
+              atomic_load(&g_diag_cursor_x), atomic_load(&g_diag_cursor_y));
+      if (site == CRASH_CTX_CURSOR_APPLY || site == CRASH_CTX_CURSOR_APPLY_DONE)
+          fprintf(stderr, "[dm] CRASH_INPUT mode=%u A=%u stick=%d,%d\n", (detail >> 30) & 1, detail >> 31,
+                  (int16_t)(detail & 0xffff), (int16_t)(detail >> 16)); }
     for (int i = 0; i < 29; i++) fprintf(stderr, "x%d=%#llx%s", i, uc->uc_mcontext->__ss.__x[i], i % 6 == 5 ? "\n" : " ");
     fprintf(stderr, "\n");
     dm_backtrace(uc->uc_mcontext->__ss.__fp);

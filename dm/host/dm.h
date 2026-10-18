@@ -77,6 +77,13 @@ void crash_watch_progress(uint32_t tick, const char *stage);
 void crash_watch_frame(void);
 void crash_watch_pregame_done(void);
 uint64_t crash_watch_progress_count(void);
+// Crash breadcrumbs: numeric site/frame/detail are written on normal paths and printed by the signal handler.
+enum { CRASH_CTX_NONE, CRASH_CTX_UI_MSG, CRASH_CTX_UI_MSG_DONE, CRASH_CTX_CURSOR_APPLY,
+       CRASH_CTX_CURSOR_APPLY_DONE, CRASH_CTX_MERC_PANEL, CRASH_CTX_MERC_SLOTS_DONE,
+       CRASH_CTX_MERC_PUMP_DONE, CRASH_CTX_RIFT_PUMP, CRASH_CTX_RIFT_PUMP_DONE,
+       CRASH_CTX_MERC_CURSOR_TRACE, CRASH_CTX_MERC_CURSOR_TRACE_DONE };
+void crash_diag_mark(uint32_t site, uint32_t frame, uint32_t detail);
+void crash_diag_cursor_state(uint64_t focus, uint64_t hover, int32_t x, int32_t y);
 void crash_dump_now(const char *why);   // 按需导出现场（线程 + 图形等待点），不退出 | Dump state on demand (threads + graphics wait points), without exiting
 // 诊断开关：main 启动时从环境变量读一次（getenv 要拿 libc 全局环境锁，进热路径会让全部客体线程排队）
 // Diagnostic switches: read once from environment variables when main starts (getenv takes the libc global environment lock, and on a hot path it would make all guest threads queue up)
